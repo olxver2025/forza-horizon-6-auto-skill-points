@@ -1,0 +1,7 @@
+psutil
+pywin32
+mss
+pytesseract
+Pillow
+pyautogui
+keyboard
