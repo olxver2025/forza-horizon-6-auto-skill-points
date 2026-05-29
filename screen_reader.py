@@ -1,5 +1,7 @@
 import time
 from typing import Optional
+import re
+from difflib import SequenceMatcher
 
 import ctypes
 import mss
@@ -12,8 +14,58 @@ pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tessera
 
 _debug_index = 0
 
+_UPSCALE = 2
+
 _OCR_CONFIG = "--psm 11 --oem 3"
+_OCR_CONFIG_BLOCK = "--psm 6 --oem 3"
+_OCR_CONFIGS = (_OCR_CONFIG, _OCR_CONFIG_BLOCK)
 _OCR_CONF_THRESHOLD = 40
+
+
+def _conf_value(value) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return -1
+
+
+def _normalise_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _text_matches(query: str, text: str, fuzzy_threshold: float = 0.84) -> bool:
+    q = _normalise_text(query)
+    t = _normalise_text(text)
+    if not q or not t:
+        return False
+    if q in t:
+        return True
+    if len(q) <= 4:
+        return False
+
+    q_tokens = q.split()
+    t_tokens = t.split()
+    window = max(1, len(q_tokens))
+    candidates = []
+    for size in (window, window + 1):
+        if size > len(t_tokens):
+            continue
+        for start in range(0, len(t_tokens) - size + 1):
+            candidates.append(" ".join(t_tokens[start:start + size]))
+
+    for candidate in candidates:
+        if SequenceMatcher(None, q, candidate).ratio() >= fuzzy_threshold:
+            return True
+
+    if len(q_tokens) > 1:
+        clipped_first = q_tokens[0][1:] if len(q_tokens[0]) > 3 else q_tokens[0]
+        clipped_query = " ".join([clipped_first] + q_tokens[1:])
+        if clipped_query in t:
+            return True
+        for candidate in candidates:
+            if SequenceMatcher(None, clipped_query, candidate).ratio() >= 0.88:
+                return True
+    return False
 
 
 def capture_screen() -> Image.Image:
@@ -67,13 +119,48 @@ def capture_screen() -> Image.Image:
         return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
 
-def _preprocess(image: Image.Image) -> Image.Image:
+def _preprocess(image: Image.Image, contrast: float = 3.0) -> Image.Image:
     grey = image.convert("L")
     # Upscale 2x — tesseract accuracy improves significantly on larger text
     w, h = grey.size
-    grey = grey.resize((w * 2, h * 2), Image.LANCZOS)
-    enhanced = ImageEnhance.Contrast(grey).enhance(3.0)
-    return enhanced.filter(ImageFilter.SHARPEN)
+    grey = grey.resize((w * _UPSCALE, h * _UPSCALE), Image.LANCZOS)
+    enhanced = ImageEnhance.Contrast(grey).enhance(contrast)
+    return enhanced.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+
+
+def _ocr_words(image: Image.Image, conf_threshold: int) -> list[str]:
+    words: list[str] = []
+    seen: set[tuple[str, int, int]] = set()
+    for config in _OCR_CONFIGS:
+        try:
+            data = pytesseract.image_to_data(
+                image, config=config, output_type=pytesseract.Output.DICT
+            )
+            for i in range(len(data["text"])):
+                word = data["text"][i].strip()
+                if not word or _conf_value(data["conf"][i]) < conf_threshold:
+                    continue
+                key = (_normalise_text(word), data["left"][i] // 20, data["top"][i] // 20)
+                if key in seen:
+                    continue
+                seen.add(key)
+                words.append(word)
+        except Exception as exc:
+            logger.debug("_ocr_words exc with %s: %s", config, exc)
+    return words
+
+
+def _read_ocr_text(image: Image.Image) -> tuple[str, Image.Image]:
+    processed = _preprocess(image)
+    words = _ocr_words(processed, _OCR_CONF_THRESHOLD)
+
+    if not words:
+        softer = _preprocess(image, contrast=1.8)
+        words = _ocr_words(softer, max(_OCR_CONF_THRESHOLD - 15, 10))
+        if words:
+            processed = softer
+
+    return " ".join(words), processed
 
 
 def find_text(image: Image.Image, query: str, region: tuple[int, int, int, int] | None = None) -> bool:
@@ -85,23 +172,8 @@ def find_text(image: Image.Image, query: str, region: tuple[int, int, int, int] 
         except Exception as exc:
             logger.debug("Region crop failed: %s", exc)
 
-    processed = _preprocess(image)
-
-    try:
-        data = pytesseract.image_to_data(
-            processed, config=_OCR_CONFIG, output_type=pytesseract.Output.DICT
-        )
-        words = [
-            data["text"][i]
-            for i in range(len(data["text"]))
-            if data["text"][i].strip() and int(data["conf"][i]) >= _OCR_CONF_THRESHOLD
-        ]
-        text = " ".join(words)
-    except Exception as exc:
-        logger.debug("OCR exception: %s", exc)
-        return False
-
-    found = query.lower() in text.lower()
+    text, processed = _read_ocr_text(image)
+    found = _text_matches(query, text)
 
     if found:
         overlay_msg(f'OCR MATCH: "{query}" found', "match")
@@ -114,6 +186,34 @@ def find_text(image: Image.Image, query: str, region: tuple[int, int, int, int] 
         _debug_index = (_debug_index + 1) % 30
 
     return found
+
+
+def find_any_text(
+    image: Image.Image,
+    queries: list[str],
+    region: tuple[int, int, int, int] | None = None,
+) -> Optional[str]:
+    global _debug_index
+    full_image = image
+    if region is not None:
+        try:
+            image = image.crop(region)
+        except Exception as exc:
+            logger.debug("Region crop failed: %s", exc)
+
+    text, processed = _read_ocr_text(image)
+    for query in queries:
+        if _text_matches(query, text):
+            overlay_msg(f'OCR MATCH (any): "{query}" found', "match")
+            return query
+
+    short = text[:120].replace("\n", " / ")
+    overlay_msg(f'OCR miss (any of {len(queries)}): got="{short}"', "ocr")
+    _debug_save(processed, "_proc", _debug_index)
+    _debug_save(image, "_raw", _debug_index)
+    _debug_save(full_image, "_full", _debug_index)
+    _debug_index = (_debug_index + 1) % 30
+    return None
 
 
 def _debug_save(img: Image.Image, suffix: str, idx: int) -> None:
@@ -162,9 +262,9 @@ def wait_for_any_text(
     start = time.monotonic()
     while True:
         img = capture_screen()
-        for query in queries:
-            if find_text(img, query):
-                return query
+        matched = find_any_text(img, queries)
+        if matched is not None:
+            return matched
         if timeout is not None and (time.monotonic() - start) >= timeout:
             logger.debug("wait_for_any_text TIMEOUT for: %s", queries)
             overlay_msg(f"TIMEOUT waiting for any of: {queries}", "warn")
