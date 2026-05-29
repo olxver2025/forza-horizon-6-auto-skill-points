@@ -21,6 +21,12 @@ _OCR_CONFIG_BLOCK = "--psm 6 --oem 3"
 _OCR_CONFIGS = (_OCR_CONFIG, _OCR_CONFIG_BLOCK)
 _OCR_CONF_THRESHOLD = 40
 
+_FINISHED_REGION_FRACS = (
+    (0.20, 0.00, 0.80, 0.38),
+    (0.18, 0.22, 0.82, 0.68),
+    (0.00, 0.00, 1.00, 0.82),
+)
+
 
 def _conf_value(value) -> int:
     try:
@@ -163,9 +169,43 @@ def _read_ocr_text(image: Image.Image) -> tuple[str, Image.Image]:
     return " ".join(words), processed
 
 
-def find_text(image: Image.Image, query: str, region: tuple[int, int, int, int] | None = None) -> bool:
+def _region_from_frac(
+    image: Image.Image,
+    region_frac: tuple[float, float, float, float],
+) -> tuple[int, int, int, int]:
+    lf, tf, rf, bf = region_frac
+    return (
+        int(image.width * lf),
+        int(image.height * tf),
+        int(image.width * rf),
+        int(image.height * bf),
+    )
+
+
+def _find_finished_text(image: Image.Image) -> bool:
+    for region_frac in _FINISHED_REGION_FRACS:
+        region = _region_from_frac(image, region_frac)
+        crop = image.crop(region)
+        text, _processed = _read_ocr_text(crop)
+        if _text_matches("finished", text, fuzzy_threshold=0.80):
+            overlay_msg('OCR MATCH: "finished" found', "match")
+            return True
+    overlay_msg('OCR miss: wanted="finished"', "ocr")
+    return False
+
+
+def find_text(
+    image: Image.Image,
+    query: str,
+    region: tuple[int, int, int, int] | None = None,
+    save_debug: bool = True,
+) -> bool:
     global _debug_index
     full_image = image  # keep reference to full capture for debug
+
+    if region is None and _normalise_text(query) == "finished":
+        return _find_finished_text(image)
+
     if region is not None:
         try:
             image = image.crop(region)
@@ -180,10 +220,11 @@ def find_text(image: Image.Image, query: str, region: tuple[int, int, int, int] 
     else:
         short = text[:120].replace("\n", " / ")
         overlay_msg(f'OCR miss: wanted="{query}" got="{short}"', "ocr")
-        _debug_save(processed, "_proc", _debug_index)
-        _debug_save(image, "_raw", _debug_index)
-        _debug_save(full_image, "_full", _debug_index)
-        _debug_index = (_debug_index + 1) % 30
+        if save_debug:
+            _debug_save(processed, "_proc", _debug_index)
+            _debug_save(image, "_raw", _debug_index)
+            _debug_save(full_image, "_full", _debug_index)
+            _debug_index = (_debug_index + 1) % 30
 
     return found
 
@@ -237,13 +278,7 @@ def wait_for_text(
         img = capture_screen()
         region = None
         if region_frac is not None:
-            lf, tf, rf, bf = region_frac
-            region = (
-                int(img.width * lf),
-                int(img.height * tf),
-                int(img.width * rf),
-                int(img.height * bf),
-            )
+            region = _region_from_frac(img, region_frac)
         if find_text(img, query, region=region):
             return True
         if timeout is not None and (time.monotonic() - start) >= timeout:

@@ -38,7 +38,7 @@ def hold_until_text(key: str, text: str, check_interval: float = 0.3, start_dela
             time.sleep(scaled_delay)
         while True:
             img = capture_screen()
-            if find_text(img, text):
+            if find_text(img, text, save_debug=False):
                 overlay_msg(f'HOLD released: found "{text}"', "match")
                 break
             time.sleep(scaled_interval)
